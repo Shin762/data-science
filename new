@@ -1,0 +1,124 @@
+# 改良: LightGBM / RandomForest による CV + 閾値最適化（F1 最大化）
+import sys, subprocess, importlib, warnings, os
+import numpy as np, pandas as pd
+
+def ensure_package(pkg):
+    try:
+        importlib.import_module(pkg)
+    except Exception:
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', pkg])
+
+for p in ['lightgbm', 'scikit-learn', 'joblib']:
+    ensure_package(p)
+
+import lightgbm as lgb
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import StratifiedKFold
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import f1_score
+
+warnings.filterwarnings('ignore')
+
+# --- 設定 ---
+target = '購入フラグ'
+# 数値列を自動選択（ターゲットを除く）
+num_cols = train.select_dtypes(include=[np.number]).columns.tolist()
+features = [c for c in num_cols if c != target and c in test.columns]
+if len(features) == 0:
+    raise ValueError('使用可能な特徴量が test に存在しません。features を確認してください。')
+print('使用する特徴量:', features)
+
+# --- データ準備 ---
+X = train[features].copy()
+y = train[target].copy()
+X_test = test[features].copy()
+
+# --- 前処理オブジェクト ---
+imputer = SimpleImputer(strategy='median')
+scaler = StandardScaler()
+
+# --- 学習関数 ---
+def train_cv_predict(model, model_name='model'):
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    oof = np.zeros(len(X))
+    preds_test = np.zeros(len(X_test))
+    for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y), 1):
+        X_tr, X_val = X.iloc[tr_idx], X.iloc[val_idx]
+        y_tr, y_val = y.iloc[tr_idx], y.iloc[val_idx]
+
+        # 前処理（学習側で fit）
+        X_tr_imp = imputer.fit_transform(X_tr)
+        X_val_imp = imputer.transform(X_val)
+        X_test_imp = imputer.transform(X_test)
+
+        X_tr_std = scaler.fit_transform(X_tr_imp)
+        X_val_std = scaler.transform(X_val_imp)
+        X_test_std = scaler.transform(X_test_imp)
+
+        if model_name == 'lgb':
+            model.fit(X_tr_std, y_tr, eval_set=[(X_val_std, y_val)])
+            val_pred = model.predict_proba(X_val_std)[:, 1]
+            test_pred = model.predict_proba(X_test_std)[:, 1]
+        else:
+            model.fit(X_tr_std, y_tr)
+            val_pred = model.predict_proba(X_val_std)[:, 1]
+            test_pred = model.predict_proba(X_test_std)[:, 1]
+
+        oof[val_idx] = val_pred
+        preds_test += test_pred / skf.n_splits
+        print(f'Fold {fold} done for {model_name}.')
+
+    # 閾値スキャンで OOF 上の最良閾値を探索
+    ths = np.linspace(0.05, 0.5, 46)
+    best_th, best_f1 = 0.5, 0.0
+    for th in ths:
+        f = f1_score(y, (oof > th).astype(int))
+        if f > best_f1:
+            best_f1 = f; best_th = th
+    print(f'{model_name} best OOF threshold={best_th:.3f}, OOF F1={best_f1:.4f}')
+    return {'oof': oof, 'test_prob': preds_test, 'best_th': best_th, 'best_f1': best_f1}
+
+# --- モデル定義 ---
+lgb_model = lgb.LGBMClassifier(n_estimators=2000, learning_rate=0.05, random_state=42, n_jobs=-1)
+rf_model = RandomForestClassifier(n_estimators=500, random_state=42, n_jobs=-1, class_weight='balanced')
+
+# --- 学習・評価 ---
+res_lgb = train_cv_predict(lgb_model, model_name='lgb')
+res_rf = train_cv_predict(rf_model, model_name='rf')
+
+# --- テスト予測の二値化（各モデルの最良閾値で） ---
+y_test_lgb = (res_lgb['test_prob'] > res_lgb['best_th']).astype(int)
+y_test_rf  = (res_rf['test_prob']  > res_rf['best_th']).astype(int)
+
+print('\nSummary:')
+print(f"LGB OOF F1: {res_lgb['best_f1']:.4f} (th={res_lgb['best_th']:.3f})")
+print(f"RF  OOF F1: {res_rf['best_f1']:.4f} (th={res_rf['best_th']:.3f})")
+
+# --- 最良モデルを選択して提出ファイルを作成 ---
+if res_lgb['best_f1'] >= res_rf['best_f1']:
+    chosen = 'lgb'
+    final_pred = y_test_lgb
+else:
+    chosen = 'rf'
+    final_pred = y_test_rf
+print(f'Chosen model: {chosen}')
+
+# sample_submit 読み込み（既にある場合は再利用）
+try:
+    sample_submit
+except NameError:
+    sample_submit = pd.read_csv(os.path.join(base_folder, 'sample_submit.csv'), header=None)
+
+sample_submit.iloc[:, 1] = final_pred
+out_name = os.path.join(base_folder, f'submission_{chosen}.csv')
+sample_submit.to_csv(out_name, index=False, header=None)
+print(f'保存: {out_name}')
+
+# --- 重要度（LGB のみ） ---
+try:
+    fi = pd.Series(lgb_model.feature_importances_, index=features).sort_values(ascending=False)
+    print('\nTop features (LGB):')
+    print(fi.head(20))
+except Exception:
+    pass
